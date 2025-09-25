@@ -27,7 +27,18 @@ try:
 except Exception:
     da = None
 
-
+def _to_dask_obsm(df: pd.DataFrame, *, row_chunks: int | None = None):
+    """
+    Wrap a pandas DataFrame as a Dask array and return (darr, index, columns).
+    Chunk rows by `row_chunks` if provided, else one chunk for all rows.
+    """
+    if da is None:
+        return None, None, None
+    vals = df.values  # NumPy (CPU) at this point
+    n_rows = vals.shape[0]
+    chunks = (min(max(1, row_chunks or n_rows), n_rows), -1)
+    darr = da.from_array(vals, chunks=chunks, asarray=False)
+    return darr, df.index.to_numpy(), df.columns.to_numpy()
 
 def _return(
     name: str,
@@ -36,23 +47,43 @@ def _return(
     pv: pd.DataFrame,
     *,
     verbose: bool = False,
+    # INTERNAL: whether the input X was Dask-backed (controls Dask obsm wrap)
+    _as_dask: bool = False,
+    _row_chunks: int | None = None,
 ) -> tuple[pd.DataFrame, pd.DataFrame] | AnnData | None:
     if isinstance(data, AnnData):
-        if data.obs_names.size != es.index.size:
-            m = "Provided AnnData contains empty observations, returning repaired object"
-            _log(m, level="warn", verbose=verbose)
-            data = data[es.index, :].copy()
-            data.obsm[f"score_{name}"] = es
+        # if Dask requested and available, put Dask arrays into obsm and labels into uns
+        if _as_dask and da is not None:
+            darr_es, idx_es, cols_es = _to_dask_obsm(es, row_chunks=_row_chunks)
+            darr_pv, idx_pv, cols_pv = (None, None, None)
             if pv is not None:
-                data.obsm[f"padj_{name}"] = pv
-            return data
+                darr_pv, idx_pv, cols_pv = _to_dask_obsm(pv, row_chunks=_row_chunks)
+
+        if data.obs_names.size != es.index.size:
+            _log("Provided AnnData contains empty observations, returning repaired object",
+                 level="warn", verbose=verbose)
+            data = data[es.index, :].copy()
+
+        if _as_dask and da is not None and darr_es is not None:
+            # scores
+            data.obsm[f"score_{name}"] = darr_es
+            data.uns[f"score_{name}_index"] = idx_es
+            data.uns[f"score_{name}_columns"] = cols_es
+            # pvals
+            if pv is not None and darr_pv is not None:
+                data.obsm[f"padj_{name}"] = darr_pv
+                data.uns[f"padj_{name}_index"] = idx_pv
+                data.uns[f"padj_{name}_columns"] = cols_pv
         else:
             data.obsm[f"score_{name}"] = es
             if pv is not None:
                 data.obsm[f"padj_{name}"] = pv
-            return None
+
+        # if we sliced out empties, return repaired object; else keep None (in-place)
+        return data if data.obs_names.size != es.index.size else None
     else:
         return es, pv
+
 
 
 def _get_batch(mat, srt, end):
@@ -132,6 +163,7 @@ def _run(
     isbacked = isinstance(mat, tuple)
     isdask = (da is not None and isinstance(mat, da.Array))
 
+
     # Process net
     net = prune(features=var, net=net, tmin=tmin, verbose=verbose)
     # Handle stat type
@@ -194,4 +226,6 @@ def _run(
     else:
         pv = None
     _log(f"{name} - done", level="info", verbose=verbose)
-    return _return(name, data, es, pv, verbose=verbose)
+    # Only wrap to Dask if input X was Dask-backed
+    return _return(name, data, es, pv, verbose=verbose, _as_dask=isdask, _row_chunks=int(bsize) if isinstance(bsize, (int, np.integer, float)) else None,)
+

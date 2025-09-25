@@ -50,6 +50,19 @@ def _validate_mat(
     verbose: bool = False,
 ) -> tuple[DataType_matrix, np.ndarray, np.ndarray]:
     assert isinstance(empty, bool), "empty must be bool"
+
+    # >>> FAST-PATH <<<
+    if empty is False:
+        # Still enforce CSR on sparse so downstream assumes consistent type
+        from cupyx.scipy.sparse import csr_matrix as cp_csr_matrix, issparse as cp_issparse
+        from scipy.sparse import csr_matrix, issparse
+        if issparse(mat) and not isinstance(mat, csr_matrix):
+            mat = csr_matrix(mat)
+        elif cp_issparse(mat) and not isinstance(mat, cp_csr_matrix):
+            mat = cp_csr_matrix(mat)
+        return mat, row, col
+    # <<< END ADDITION >>>
+    
     # Accept any sparse format but transform to csr
     if issparse(mat) and not isinstance(mat, csr_matrix):
         mat = csr_matrix(mat)
@@ -123,6 +136,12 @@ def _validate_backed(
     verbose: bool = False,
     bsize: int = 250_000,
 ) -> np.ndarray:
+
+    # >>> ADD <<<
+    if empty is False:
+        # No features to drop; return all-False mask
+        return np.zeros(mat.shape[1], dtype=bool)
+    # <<< END ADDITION >>>
     nbatch = int(np.ceil(row.size / bsize))
     msk_col = np.zeros((nbatch, mat.shape[1]), dtype=bool)
     for i in tqdm(range(nbatch), disable=not verbose):

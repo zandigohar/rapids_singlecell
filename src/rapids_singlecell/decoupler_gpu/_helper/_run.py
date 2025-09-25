@@ -21,6 +21,13 @@ if TYPE_CHECKING:
 
     from rapids_singlecell.decoupler_gpu._helper._data import DataType
 
+# Dask is optional; if missing, we keep current behavior
+try:
+    import dask.array as da
+except Exception:
+    da = None
+
+
 
 def _return(
     name: str,
@@ -49,6 +56,11 @@ def _return(
 
 
 def _get_batch(mat, srt, end):
+    # NEW: if Dask-backed, compute just this row block to a CPU array/sparse
+    if da is not None and isinstance(mat, da.Array):
+        mat = mat[srt:end, :].compute()
+        srt, end = 0, mat.shape[0]  # we already sliced; normalize indices
+
     if sps.issparse(mat):
         bmat = csps.csr_matrix(mat[srt:end])
         bmat = _sparse_to_dense(bmat)
@@ -59,6 +71,7 @@ def _get_batch(mat, srt, end):
     elif isinstance(mat, cp.ndarray):
         bmat = mat[srt:end, :]
     else:
+        # backed tuple path (unchanged)
         bmat, msk_col = mat
         bmat = bmat[srt:end, :]
         if sps.issparse(bmat):
@@ -68,6 +81,7 @@ def _get_batch(mat, srt, end):
             bmat = cp.array(bmat)
         bmat = bmat[:, msk_col]
     return bmat.astype(cp.float32)
+
 
 
 def _mat_to_array(mat):
@@ -116,6 +130,8 @@ def _run(
     )
     issparse = sps.issparse(mat) or csps.issparse(mat)
     isbacked = isinstance(mat, tuple)
+    isdask = (da is not None and isinstance(mat, da.Array))
+
     # Process net
     net = prune(features=var, net=net, tmin=tmin, verbose=verbose)
     # Handle stat type
@@ -123,7 +139,7 @@ def _run(
         sources, targets, adjm = adjmat(features=var, net=net, verbose=verbose)
         adjm = cp.array(adjm, dtype=cp.float32)
         # Handle batches
-        if issparse or isbacked:
+        if issparse or isbacked or isdask:
             nbatch = int(np.ceil(obs.size / bsize))
             es, pv = [], []
             for i in tqdm(range(nbatch), disable=not verbose):
